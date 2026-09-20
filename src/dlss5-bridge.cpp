@@ -60,6 +60,8 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include "bounded-report.h"
+#include "present-config-gate.h"
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
@@ -4074,6 +4076,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         // running DLL detach, so absence proves nothing and reporting it would
         // claim a crash on every ordinary launch.
         char carried[2048] = {};
+        bool carried_truncated = false;
         {
             FILE *old = nullptr;
             if (fopen_s(&old, g_log_path, "r") == 0 && old != nullptr)
@@ -4086,10 +4089,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
                     {
                         in_report = true;
                         carried[0] = '\0';
+                        carried_truncated = false;
                         continue;
                     }
                     if (in_report && strstr(line, "####") != nullptr) break;
-                    if (in_report) strcat_s(carried, line);
+                    if (in_report && !AppendCrashReport(carried, line))
+                        carried_truncated = true;
                 }
                 fclose(old);
             }
@@ -4107,6 +4112,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         {
             Log("The previous run crashed. What it recorded at the time:");
             Log("%s", carried);
+            if (carried_truncated) Log("[bridge] Previous crash report truncated safely at 2047 bytes.");
         }
 
         LogEnvironment();
