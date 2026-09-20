@@ -8480,10 +8480,12 @@ static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
     // nothing else runs the D3D11 frame path, so a key the panel wrote --
     // synth=1 from the switch -- stayed unread until the game's DLSS came back,
     // and the switch read as unticked one frame after every click. Rate
-    // limited inside; under g_bridge_cs like the other call sites.
-    EnterCriticalSection(&g_bridge_cs);
-    CfgReload();
-    LeaveCriticalSection(&g_bridge_cs);
+    // limited inside; still protected by g_bridge_cs, but this optional poll
+    // must not block the frame-generation/present thread. Endfield's Vulkan
+    // mirror can hold this lock while waiting for its worker, whose GPU input
+    // is queued behind FG completion. ETW confirmed that blocking this callback
+    // closes that wait cycle until the worker's 300 ms timeout fires.
+    if (!TryReloadPresentConfig(g_bridge_cs, [] { CfgReload(); })) return;
 
     if (!SynthEnabled() || rt == nullptr || cmd == nullptr) return;
 
