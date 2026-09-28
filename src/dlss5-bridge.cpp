@@ -65,7 +65,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.4.13-pre8"
+#define BRIDGE_VERSION "1.4.13-pre8-vk-fginput"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 Bridge " BRIDGE_VERSION;
@@ -128,6 +128,7 @@ typedef NVSDK_NGX_Result (*PFN_Create)(ID3D11DeviceContext *, int,
 static CRITICAL_SECTION g_log_cs;
 static char             g_log_path[MAX_PATH];
 static HMODULE          g_self;
+#include "present-adapter-config.h"
 
 // Anything that means "your setup is wrong" also goes into ReShade's own log,
 // where its overlay shows it. People reliably post ReShade.log instead of this

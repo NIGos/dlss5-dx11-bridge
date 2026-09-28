@@ -278,6 +278,8 @@ struct VkMirror
     SVkHandle ev_out[2]; // host -> device: the D3D12 evaluate is done
     int       next;      // the pair the next frame takes; render thread only
     volatile LONG cur;   // the pair the worker is servicing
+    // The armed frame belongs to the FG-input feed rather than the DLSS mirror.
+    volatile LONG fg_arm;
     HANDLE    idle;      // manual reset, set while no frame is parked
     HANDLE    wake;      // auto reset, kicks the worker
     HANDLE    worker;
@@ -575,6 +577,8 @@ static void VkmRefuse(const char *why)
 // The worker
 // ---------------------------------------------------------------------------
 
+static bool FgInputWorker();
+
 static DWORD WINAPI VkmWorkerProc(LPVOID)
 {
     PollYield poll_yield;
@@ -623,13 +627,20 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
             // the detour returns -- but it is the last point this thread can
             // observe, and stage 2 records no copy back at all.
             // Serialised against the game's own NGX evaluate -- see g_ngx_cs.
-            if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-            // The game's GPU is parked behind every GPU wait inside this call,
-            // so it is not the synthetic path's four seconds. Passed rather than
-            // set on a global: the same global was still standing at 900 for the
-            // D3D11/D3D12 transport, which parks nothing.
-            const bool ev_ok = Synth12EvaluateShared(&g_vkm.sp, kVkmEvaluateMs);
-            if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
+            const bool fg_frame = InterlockedExchange(&g_vkm.fg_arm, 0) != 0;
+            bool ev_ok;
+            if (fg_frame)
+                ev_ok = FgInputWorker();
+            else
+            {
+                if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
+                // The game's GPU is parked behind every GPU wait inside this call,
+                // so it is not the synthetic path's four seconds. Passed rather than
+                // set on a global: the same global was still standing at 900 for the
+                // D3D11/D3D12 transport, which parks nothing.
+                ev_ok = Synth12EvaluateShared(&g_vkm.sp, kVkmEvaluateMs);
+                if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
+            }
             if (ev_ok)
             {
                 // Both counters clear here: a frame that arrived and evaluated is
@@ -1771,6 +1782,8 @@ typedef NVSDK_NGX_Result (*PFN_VkCreate1)(void *, void *, int, NVSDK_NGX_Paramet
     if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs); \
     return r_;
 
+#include "fg-input.inc"
+
 static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
                                           const NVSDK_NGX_Handle *handle,
                                           const NVSDK_NGX_Parameter *p, void *cb)
@@ -1798,7 +1811,41 @@ static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
         VKM_FORWARD(fwd(cmd, handle, p, cb))
     }
 
-    if (IsOtherFeature(handle)) { VKM_FORWARD(fwd(cmd, handle, p, cb)) }
+    if (IsOtherFeature(handle))
+    {
+        // Never block the present thread on the render thread's lock: a skipped
+        // frame keeps the game's own image, a blocked one can deadlock the device.
+        if (PresentAdapterFgInput() && FgInputIsFgHandle(handle) && TryEnterCriticalSection(&g_bridge_cs))
+        {
+            FgInputFrame(cmd, p);
+            LeaveCriticalSection(&g_bridge_cs);
+        }
+        VKM_FORWARD(fwd(cmd, handle, p, cb))
+    }
+
+    // Present selected in Generic: the FG-input feed owns the session; the mirror
+    // stands aside and hands its resources over on the render thread.
+    const bool fg_selected = PresentAdapterFgInput() && FgInputActive();
+    if (PresentAdapterFollow())
+    {
+        EnterCriticalSection(&g_bridge_cs);
+        const LONG owner = InterlockedCompareExchange(&g_adapter_owner, 0, 0);
+        if (fg_selected && owner == OWNER_MIRROR) MirrorReleaseForFgInput();
+        else if (owner == OWNER_FG && (!fg_selected || g_fg_input.want_release)) FgInputRelease();
+        LeaveCriticalSection(&g_bridge_cs);
+    }
+    if ((PresentationAdapterEnabled() && !PresentAdapterFollow()) || fg_selected)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log(PresentAdapterFgInput()
+                ? "[fg-input] native Vulkan DLSS is forwarded without a mirror; the real frame is processed once at the frame-generation input."
+                : "[present-adapter] native Vulkan DLSS is forwarded without a mirror; final-colour processing is request-controlled at ReShade begin-effects.");
+        }
+        VKM_FORWARD(fwd(cmd, handle, p, cb))
+    }
 
     // source=synth pins the synthetic contract, so the mirror stands aside even
     // when the game has DLSS of its own. See the same block in dlss5-bridge.cpp:
@@ -1868,6 +1915,7 @@ static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
         g_s12.w = 0;
         g_s12.need_reset = true;
     }
+    if (PresentAdapterFollow()) InterlockedExchange(&g_adapter_owner, OWNER_MIRROR);
     VkMirrorFrame(cmd, p);
     LeaveCriticalSection(&g_bridge_cs);
 
@@ -1881,6 +1929,7 @@ static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
 static void VkmNoteCreated(int feature_id, NVSDK_NGX_Result r, NVSDK_NGX_Handle **out)
 {
     if (r != NGX_SUCCESS || out == nullptr || *out == nullptr) return;
+    FgInputNoteCreated(feature_id, r, out);
 
     if (feature_id == 1)
     {
@@ -1920,6 +1969,7 @@ static void VkmNoteCreated(int feature_id, NVSDK_NGX_Result r, NVSDK_NGX_Handle 
 static void VkmNoteGameCreate(int feature_id, NVSDK_NGX_Result r,
                               const NVSDK_NGX_Parameter *p)
 {
+    if (PresentationAdapterEnabled() && !PresentAdapterFollow()) return;
     if (r != NGX_SUCCESS || feature_id != 1) return;
 
     unsigned int cw = 0, ch = 0, cow = 0, coh = 0;

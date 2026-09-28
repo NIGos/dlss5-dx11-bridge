@@ -1866,34 +1866,44 @@ static bool PqBackBuffer(DXGI_FORMAT f)
 // is parked behind those.
 static bool PqPassWait(PqPass *p, UINT64 value, DWORD wait_ms = 4000)
 {
-    if (p->fence == nullptr || p->fence->GetCompletedValue() >= value) return true;
+    if (p->fence == nullptr) return true;
+    const UINT64 completed = p->fence->GetCompletedValue();
+    if (completed == UINT64_MAX) return false;
+    if (completed >= value) return true;
     if (FAILED(p->fence->SetEventOnCompletion(value, p->ev))) return false;
-    return WaitForSingleObject(p->ev, wait_ms) == WAIT_OBJECT_0;
+    if (WaitForSingleObject(p->ev, wait_ms) != WAIT_OBJECT_0) return false;
+    const UINT64 after = p->fence->GetCompletedValue();
+    return after != UINT64_MAX && after >= value;
 }
 
-static void PqPassRelease(PqPass *p)
+static bool PqPassRelease(PqPass *p)
 {
-    // The lists may still name the textures: let them finish first.
-    if (p->fence != nullptr) PqPassWait(p, p->fv);
+    if (!PqPassWait(p, p->fv)) {
+        Log("[bridge] colour-pass completion unproven; retaining its resources.");
+        return false;
+    }
     if (p->in  != nullptr) { p->in->Release();  p->in  = nullptr; }
     if (p->out != nullptr) { p->out->Release(); p->out = nullptr; }
     p->colour = p->output = p->output_b = nullptr;
+    return true;
 }
 
 // One shader, one root constant choosing the direction: 0 decodes colour into
 // in, 1 encodes out into output. The BT.2020 matrices are the ones an HDR10
 // surface implies; the model side is BT.709.
 static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3D12Resource *output,
-                       ID3D12Resource *output_b = nullptr)
+                       ID3D12Resource *output_b = nullptr, bool srgb = false)
 {
-    PqPassRelease(p);
+    if (!PqPassRelease(p)) return false;
     p->dev      = dev;
+    p->srgb     = srgb;
     p->colour   = colour;
     p->output   = output;
     p->output_b = output_b;
     const D3D12_RESOURCE_DESC cd = colour->GetDesc(), od = output->GetDesc();
     p->cw = static_cast<UINT>(cd.Width); p->ch = cd.Height;
     p->ow = static_cast<UINT>(od.Width); p->oh = od.Height;
+    const DXGI_FORMAT linear_format = srgb ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
 
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1901,7 +1911,8 @@ static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3
     rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     rd.DepthOrArraySize = 1;
     rd.MipLevels        = 1;
-    rd.Format           = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    // Wide-gamut cancellation can destroy dark HDR channels in FP16 intermediates.
+    rd.Format           = linear_format;
     rd.SampleDesc.Count = 1;
     rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -1915,8 +1926,8 @@ static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3
             reinterpret_cast<void **>(pair[i]));
         if (FAILED(hr))
         {
-            Log("[bridge] the %llux%u R16G16B16A16_FLOAT texture for the HDR10 %s could not be "
-                "created: 0x%08X", rd.Width, rd.Height, i == 0 ? "decode" : "encode", hr);
+            Log("[bridge] the %llux%u %s texture for colour %s could not be created: 0x%08X",
+                rd.Width, rd.Height, FormatName(linear_format), i == 0 ? "decode" : "encode", hr);
             PqPassRelease(p);
             return false;
         }
@@ -1945,12 +1956,12 @@ static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3
             "cbuffer C : register(b0) { uint mode; };\n"
             "static const float m1 = 0.1593017578125, m2 = 78.84375;\n"
             "static const float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
-            "static const float3x3 k2020to709 = { 1.6605, -0.5876, -0.0728,\n"
-            "                                    -0.1246,  1.1329, -0.0083,\n"
-            "                                    -0.0182, -0.1006,  1.1187 };\n"
-            "static const float3x3 k709to2020 = { 0.6274, 0.3293, 0.0433,\n"
-            "                                     0.0691, 0.9195, 0.0114,\n"
-            "                                     0.0164, 0.0880, 0.8956 };\n"
+            "static const float3x3 k2020to709 = { 1.6604910021, -0.5876411388, -0.0728498633,\n"
+            "                                    -0.1245504745, 1.1328998971, -0.0083494226,\n"
+            "                                    -0.0181507634, -0.1005788980, 1.1187296614 };\n"
+            "static const float3x3 k709to2020 = { 0.6274038959, 0.3292830384, 0.0433130657,\n"
+            "                                     0.0690972894, 0.9195403951, 0.0113623156,\n"
+            "                                     0.0163914389, 0.0880133079, 0.8955952532 };\n"
             "float3 pq_to_nits(float3 e)\n"
             "{\n"
             "    float3 p = pow(max(e, 0.0), 1.0 / m2);\n"
@@ -1961,13 +1972,19 @@ static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3
             "    float3 y = pow(saturate(n / 10000.0), m1);\n"
             "    return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);\n"
             "}\n"
+            "float3 srgb_decode(float3 v) { return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4); }\n"
+            "float3 srgb_encode(float3 v) { v = saturate(v); return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055; }\n"
             "[numthreads(8,8,1)]\n"
             "void main(uint3 id : SV_DispatchThreadID)\n"
             "{\n"
             "    uint w, h; dst.GetDimensions(w, h);\n"
             "    if (id.x >= w || id.y >= h) return;\n"
             "    float4 v = src[id.xy];\n"
-            "    if (mode == 0)\n"
+            "    if (mode == 2)\n"
+            "        dst[id.xy] = float4(srgb_decode(v.rgb), v.a);\n"
+            "    else if (mode == 3)\n"
+            "        dst[id.xy] = float4(srgb_encode(v.rgb), v.a);\n"
+            "    else if (mode == 0)\n"
             "        dst[id.xy] = float4(mul(k2020to709, pq_to_nits(v.rgb)) / 80.0, v.a);\n"
             "    else\n"
             "        dst[id.xy] = float4(nits_to_pq(mul(k709to2020, v.rgb * 80.0)), v.a);\n"
@@ -2064,10 +2081,10 @@ static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3
     cpu.ptr += inc;
     D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
     ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    ud.Format        = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    ud.Format        = linear_format;
     dev->CreateUnorderedAccessView(p->in, nullptr, &ud, cpu);
     cpu.ptr += inc;
-    sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    sd.Format = linear_format;
     dev->CreateShaderResourceView(p->out, &sd, cpu);
     cpu.ptr += inc;
     ud.Format = od.Format;
@@ -2080,16 +2097,16 @@ static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3
     {
         const D3D12_RESOURCE_DESC bd = output_b->GetDesc();
         cpu.ptr += inc;
-        sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        sd.Format = linear_format;
         dev->CreateShaderResourceView(p->out, &sd, cpu);
         cpu.ptr += inc;
         ud.Format = bd.Format;
         dev->CreateUnorderedAccessView(output_b, nullptr, &ud, cpu);
     }
 
-    Log("[bridge] HDR10 PQ conversion ready: the %s back buffer is decoded to linear BT.709 "
-        "(1.0 = 80 nits) before the evaluate and the result encoded again after, so the "
-        "contract can say IsHDR and mean it.", FormatName(cd.Format));
+    Log("[bridge] %s conversion ready: %s -> linear BT.709 %s -> original encoding.",
+        srgb ? "sRGB" : "HDR10 PQ", FormatName(cd.Format),
+        srgb ? "(normalized SDR)" : "(1.0 = 80 nits)");
     return true;
 }
 
@@ -2108,7 +2125,7 @@ static void PqPassDispatch(PqPass *p, ID3D12GraphicsCommandList *list, int mode,
     // pipeline does not double colour.
     gpu.ptr += static_cast<UINT64>(mode == 0 ? 0 : 2 + 2 * set) * inc;
     list->SetComputeRootDescriptorTable(0, gpu);
-    list->SetComputeRoot32BitConstant(1, static_cast<UINT>(mode), 0);
+    list->SetComputeRoot32BitConstant(1, static_cast<UINT>(mode + (p->srgb ? 2 : 0)), 0);
     const UINT w = mode == 0 ? p->cw : p->ow, h = mode == 0 ? p->ch : p->oh;
     list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
 }
@@ -2151,11 +2168,12 @@ static bool PqPassRun(PqPass *p, ID3D12CommandQueue *queue, int mode, int set,
         Barrier(list, p->out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         Barrier(list, p->in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
-    list->Close();
+    if (FAILED(list->Close())) return false;
     ID3D12CommandList *lists[] = { list };
     queue->ExecuteCommandLists(1, lists);
-    queue->Signal(p->fence, ++p->fv);
-    p->done[mode] = p->fv;
+    const UINT64 value = ++p->fv;
+    if (FAILED(queue->Signal(p->fence, value))) return false;
+    p->done[mode] = value;
     return true;
 }
 
@@ -2174,7 +2192,7 @@ static UINT64 PqPassAfter(PqPass *p, ID3D12CommandQueue *queue, ID3D12Fence *ses
 {
     if (!PqPassRun(p, queue, 1, set, wait_ms)) return fallback;
     const UINT64 v = ++*session_value;
-    queue->Signal(session_fence, v);
+    if (FAILED(queue->Signal(session_fence, v))) return fallback;
     return v;
 }
 
