@@ -70,6 +70,7 @@ Three routes; the substitute is off by default:
 | --- | --- | --- |
 | **D3D11 bridge** | DirectX 11 with DLSS | The game's Color, Depth and MotionVectors are copied into shared textures, evaluated on D3D12 and copied back. The bridge follows the supplied dimensions, regions and parameters, with defaults for missing values. |
 | **Vulkan mirror** | Vulkan with DLSS | The game's own, mirrored the same way through imported D3D12 textures. `vk_mirror=1`, the default. |
+| **Vulkan final-frame feed** | Vulkan with DLSS Frame Generation | The neural add-on's "Present" hook point, which it does not serve on Vulkan itself: the real frame is processed once at the game's Frame Generation input (HUD-less in, UI preserved), so FG interpolates the enhanced image and the presented multiplier stays. Opt-in through `vk-present-adapter.ini`; see [VULKAN-FG-INPUT-NR.md](VULKAN-FG-INPUT-NR.md). |
 | **Substitute contract** | Games without DLSS that expose usable depth and motion inputs through ReShade | DLAA at back-buffer size, using NVIDIA Optical Flow or a ReShade motion-vector shader. Requires `synth=1`; availability depends on the API, driver and inputs. |
 
 With `source=auto`, the game's own DLSS takes priority. Prefer that route when
@@ -173,6 +174,10 @@ not re-read until the game's DLSS goes quiet.
 | `unwrap_list` | 0 | `1` hands NGX the command list underneath ReShade's proxy. Diagnostic. |
 | `probe` | 0 | `1` runs a standalone NGX D3D12 probe at attach and logs the result. Diagnostic. |
 | `hash_out` | 1 | Once per feature build, 60 frames in, read the input and the output back and log a hash of the output, the mean of each channel of both, and the brightness ratio out/in. One readback per build; `0` disables. D3D11 bridge only. |
+
+A second, optional file beside the add-on, `vk-present-adapter.ini`, enables the
+Vulkan final-frame feed (`Enabled=1`, `Source=fg-input`, `Follow=1`); it is read
+once at start-up and documented in `src/vk-present-adapter.ini.example`.
 
 ## Status panel
 

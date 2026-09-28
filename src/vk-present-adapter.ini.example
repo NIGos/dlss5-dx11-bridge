@@ -1,0 +1,26 @@
+[Adapter]
+; Optional, read once at start-up. Without this file the bridge behaves exactly as before.
+;
+; Enabled=1     Enable the final-image adapter. The bridge stops mirroring the game's own
+;               DLSS evaluate and instead feeds Generic the frame chosen by Source below.
+; Source        fg-input  Process each real frame once at the native DLSS Frame Generation
+;                         evaluate (feature 11): HUD-less -> Generic NR -> UI-preserving
+;                         composite into the back buffer, then FG interpolates from the
+;                         processed frames. Presented multiplier is preserved.
+;               present   (default) Process every ReShade begin-effects present, including
+;                         FG-generated ones. Correct picture but bounded by NR throughput
+;                         (~29 presents/s at 5120x2160 with two NR passes); kept for
+;                         reference and for the offline round-trip test.
+; Follow=1      Let Generic's own "Hook point" select the path: Present (2) runs the
+;               fg-input feed continuously; Upscaled (0) / Render (1) run the native mirror.
+;               The private D3D12 session is handed over on the render thread when the
+;               setting changes. Only meaningful with Source=fg-input.
+; AutoRun=1     Run the fg-input feed continuously without a request file (ignored when
+;               Follow=1, which already runs it while Present is selected).
+;
+; Request file (vk-present-adapter.request, "token frames mode", mode 0=copy 1=NR
+; 2=colour round-trip): a new token starts a bounded run of up to 1800 frames / 60 s;
+; frames=0 stops any run, including AutoRun/Follow, until the game restarts.
+Enabled=0
+Source=fg-input
+Follow=1
