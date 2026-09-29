@@ -278,6 +278,8 @@ struct VkMirror
     SVkHandle ev_out[2]; // host -> device: the D3D12 evaluate is done
     int       next;      // the pair the next frame takes; render thread only
     volatile LONG cur;   // the pair the worker is servicing
+    // The armed frame belongs to the FG-input feed rather than the DLSS mirror.
+    volatile LONG fg_arm;
     HANDLE    idle;      // manual reset, set while no frame is parked
     HANDLE    wake;      // auto reset, kicks the worker
     HANDLE    worker;
@@ -339,6 +341,18 @@ static reshade::api::effect_runtime *g_vkm_rt;
 // Only allocation/free and FG creation touch this table, never draw/evaluate.
 static std::mutex g_vkm_cmd_mutex;
 static std::unordered_map<uint64_t, uint64_t> g_vkm_cmd_devices;
+
+// fg-trace.inc, included after the FG-input feed; the runtime hooks above it call in.
+static void FgtRegisterEvents(PFN_ReShadeRegisterEvent reg);
+static void FgtOnRuntime(reshade::api::effect_runtime *rt);
+// fg-relay.inc, included after this file's worker but called from it (and from
+// fg-input.inc's release paths, which is included just below).
+static bool FgRelayPending();
+static bool FgRelayWorker();
+static bool FgRelayIdleForRelease();
+static void FgRelayOnSessionRelease();
+static void FgRelayForceReleaseParks();
+static int  FgRelayEvaluate(void *cmd_raw, const NVSDK_NGX_Parameter *p);
 
 static void OnVkmInitCommandList(reshade::api::command_list *cmd)
 {
@@ -416,6 +430,7 @@ static void OnVkmInitRuntime(reshade::api::effect_runtime *rt)
     if (!is_vk) return;
 
     g_vkm_rt = rt;
+    FgtOnRuntime(rt);
     if (g_vkm.stopping)
     {
         g_vkm.stopping = false;
@@ -540,6 +555,7 @@ static void VkmRegisterEvents()
     reg(reshade::addon_event::init_command_list,      reinterpret_cast<void *>(&OnVkmInitCommandList));
     reg(reshade::addon_event::destroy_command_list,   reinterpret_cast<void *>(&OnVkmDestroyCommandList));
     reg(reshade::addon_event::destroy_device,         reinterpret_cast<void *>(&OnVkmDestroyDevice));
+    FgtRegisterEvents(reg);
     Log("[vkmirror] vk_mirror=1: the Vulkan NGX entry points will be hooked and a Vulkan "
         "game's own DLSS contract mirrored onto the private D3D12 session.");
 }
@@ -575,6 +591,8 @@ static void VkmRefuse(const char *why)
 // The worker
 // ---------------------------------------------------------------------------
 
+static bool FgInputWorker();
+
 static DWORD WINAPI VkmWorkerProc(LPVOID)
 {
     PollYield poll_yield;
@@ -595,6 +613,23 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
                     if (g_vkm.ev_out[i] != 0) g_svk.EvSet(g_svk.dev, g_vkm.ev_out[i]);
             SetEvent(g_vkm.idle);
             break;
+        }
+
+        // A relay frame (Pipeline=2/3) is taken before the serial feed's poll:
+        // its copies have no ev_in to observe -- their completion reaches this
+        // thread through the copy fence or the shared semaphore, inside
+        // FgRelayWorker -- and its park is released by the D3D12 side.
+        if (FgRelayPending())
+        {
+            const bool rel_ok = FgRelayWorker();
+            if (rel_ok)
+            {
+                if (g_vkm.stalls != 0) g_vkm.stalls = 0;
+                g_vkm.fails = 0;
+                if (g_cfg.stage >= 3) CountDelivered();
+            }
+            SetEvent(g_vkm.idle);
+            continue;
         }
 
         // Poll rather than wait: a VkEvent signalled by the GPU has no waitable
@@ -623,13 +658,20 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
             // the detour returns -- but it is the last point this thread can
             // observe, and stage 2 records no copy back at all.
             // Serialised against the game's own NGX evaluate -- see g_ngx_cs.
-            if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-            // The game's GPU is parked behind every GPU wait inside this call,
-            // so it is not the synthetic path's four seconds. Passed rather than
-            // set on a global: the same global was still standing at 900 for the
-            // D3D11/D3D12 transport, which parks nothing.
-            const bool ev_ok = Synth12EvaluateShared(&g_vkm.sp, kVkmEvaluateMs);
-            if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
+            const bool fg_frame = InterlockedExchange(&g_vkm.fg_arm, 0) != 0;
+            bool ev_ok;
+            if (fg_frame)
+                ev_ok = FgInputWorker();
+            else
+            {
+                if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
+                // The game's GPU is parked behind every GPU wait inside this call,
+                // so it is not the synthetic path's four seconds. Passed rather than
+                // set on a global: the same global was still standing at 900 for the
+                // D3D11/D3D12 transport, which parks nothing.
+                ev_ok = Synth12EvaluateShared(&g_vkm.sp, kVkmEvaluateMs);
+                if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
+            }
             if (ev_ok)
             {
                 // Both counters clear here: a frame that arrived and evaluated is
@@ -751,6 +793,11 @@ static bool VkmShutdown()
     if (g_svk.EvSet != nullptr && g_svk.dev != nullptr)
         for (int i = 0; i < 2; ++i)
             if (g_vkm.ev_out[i] != 0) g_svk.EvSet(g_svk.dev, g_vkm.ev_out[i]);
+
+    // The relay's parks too: its release is a D3D12 signal this thread is about
+    // to stop servicing, and the command buffer parked on one of its events is
+    // the game's own.
+    FgRelayForceReleaseParks();
 
     if (!joined)
     {
@@ -1771,6 +1818,10 @@ typedef NVSDK_NGX_Result (*PFN_VkCreate1)(void *, void *, int, NVSDK_NGX_Paramet
     if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs); \
     return r_;
 
+#include "fg-input.inc"
+#include "fg-relay.inc"
+#include "fg-trace.inc"
+
 static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
                                           const NVSDK_NGX_Handle *handle,
                                           const NVSDK_NGX_Parameter *p, void *cb)
@@ -1798,7 +1849,45 @@ static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
         VKM_FORWARD(fwd(cmd, handle, p, cb))
     }
 
-    if (IsOtherFeature(handle)) { VKM_FORWARD(fwd(cmd, handle, p, cb)) }
+    if (IsOtherFeature(handle))
+    {
+        // Never block the present thread on the render thread's lock: a skipped
+        // frame keeps the game's own image, a blocked one can deadlock the device.
+        if (PresentAdapterFgInput() && FgInputIsFgHandle(handle))
+        {
+            FgTraceEvaluate(cmd, p);
+            if (TryEnterCriticalSection(&g_bridge_cs))
+            {
+                FgInputFrame(cmd, p);
+                LeaveCriticalSection(&g_bridge_cs);
+            }
+        }
+        VKM_FORWARD(fwd(cmd, handle, p, cb))
+    }
+
+    // Present selected in Generic: the FG-input feed owns the session; the mirror
+    // stands aside and hands its resources over on the render thread.
+    const bool fg_selected = PresentAdapterFgInput() && FgInputActive();
+    if (PresentAdapterFollow())
+    {
+        EnterCriticalSection(&g_bridge_cs);
+        const LONG owner = InterlockedCompareExchange(&g_adapter_owner, 0, 0);
+        if (fg_selected && owner == OWNER_MIRROR) MirrorReleaseForFgInput();
+        else if (owner == OWNER_FG && (!fg_selected || g_fg_input.want_release)) FgInputRelease();
+        LeaveCriticalSection(&g_bridge_cs);
+    }
+    if ((PresentationAdapterEnabled() && !PresentAdapterFollow()) || fg_selected)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log(PresentAdapterFgInput()
+                ? "[fg-input] native Vulkan DLSS is forwarded without a mirror; the real frame is processed once at the frame-generation input."
+                : "[present-adapter] native Vulkan DLSS is forwarded without a mirror; final-colour processing is request-controlled at ReShade begin-effects.");
+        }
+        VKM_FORWARD(fwd(cmd, handle, p, cb))
+    }
 
     // source=synth pins the synthetic contract, so the mirror stands aside even
     // when the game has DLSS of its own. See the same block in dlss5-bridge.cpp:
@@ -1868,6 +1957,7 @@ static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
         g_s12.w = 0;
         g_s12.need_reset = true;
     }
+    if (PresentAdapterFollow()) InterlockedExchange(&g_adapter_owner, OWNER_MIRROR);
     VkMirrorFrame(cmd, p);
     LeaveCriticalSection(&g_bridge_cs);
 
@@ -1881,6 +1971,7 @@ static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
 static void VkmNoteCreated(int feature_id, NVSDK_NGX_Result r, NVSDK_NGX_Handle **out)
 {
     if (r != NGX_SUCCESS || out == nullptr || *out == nullptr) return;
+    FgInputNoteCreated(feature_id, r, out);
 
     if (feature_id == 1)
     {
@@ -1920,6 +2011,7 @@ static void VkmNoteCreated(int feature_id, NVSDK_NGX_Result r, NVSDK_NGX_Handle 
 static void VkmNoteGameCreate(int feature_id, NVSDK_NGX_Result r,
                               const NVSDK_NGX_Parameter *p)
 {
+    if (PresentationAdapterEnabled() && !PresentAdapterFollow()) return;
     if (r != NGX_SUCCESS || feature_id != 1) return;
 
     unsigned int cw = 0, ch = 0, cow = 0, coh = 0;

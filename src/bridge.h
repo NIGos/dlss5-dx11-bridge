@@ -95,6 +95,7 @@ struct PqPass
     ID3D12RootSignature  *rs;
     ID3D12PipelineState  *pso;
     ID3D12DescriptorHeap *heap;
+    bool                  srgb;
     UINT                  cw, ch, ow, oh;
     // Not owned: the session's colour and output textures the passes convert.
     // output_b is the substitute's second Output, and it is null on every other

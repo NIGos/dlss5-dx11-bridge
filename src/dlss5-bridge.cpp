@@ -41,6 +41,7 @@
 #include <windows.h>
 #include <MinHook.h>
 #include "module-lifetime.h"
+#include "ngx-module-scan.h"
 // SHA-256 for identifying a neighbour build whose version resource does not.
 #include <bcrypt.h>
 #include <d3d11.h>
@@ -60,10 +61,12 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include "bounded-report.h"
+#include "present-config-gate.h"
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.4.13-pre8"
+#define BRIDGE_VERSION "1.4.13-pre8-vk-fgrelay"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 Bridge " BRIDGE_VERSION;
@@ -126,6 +129,7 @@ typedef NVSDK_NGX_Result (*PFN_Create)(ID3D11DeviceContext *, int,
 static CRITICAL_SECTION g_log_cs;
 static char             g_log_path[MAX_PATH];
 static HMODULE          g_self;
+#include "present-adapter-config.h"
 
 // Anything that means "your setup is wrong" also goes into ReShade's own log,
 // where its overlay shows it. People reliably post ReShade.log instead of this
@@ -2638,16 +2642,16 @@ static volatile bool g_shutting_down = false;
 // reference can run arbitrary DLL_PROCESS_DETACH code and acquire other locks.
 struct ScanModuleRefs
 {
+    NgxModuleScanner scanner;
     HMODULE modules[1024] = {};
     DWORD count = 0;
-    bool Acquire(HMODULE module)
+    NgxScanResult Acquire(HMODULE module)
     {
-        if (count == _countof(modules)) return false;
+        if (count == _countof(modules)) return NgxScanResult::skipped;
         HMODULE held = nullptr;
-        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                reinterpret_cast<LPCWSTR>(module), &held)) return false;
-        modules[count++] = held;
-        return true;
+        const NgxScanResult result = scanner.Acquire(module, g_vk_mirror != 0, held);
+        if (result == NgxScanResult::acquired) modules[count++] = held;
+        return result;
     }
     ~ScanModuleRefs()
     {
@@ -2673,7 +2677,19 @@ static int HookNewNgxModules(ScanModuleRefs &held)
     for (DWORD i = 0; i < count; ++i)
     {
         if (g_shutting_down) break;
-        if (!held.Acquire(mods[i])) continue;
+        const NgxScanResult acquired = held.Acquire(mods[i]);
+        if (acquired == NgxScanResult::retry)
+        {
+            InterlockedExchange(&g_scan_pending, 1);
+            break;
+        }
+        if (acquired == NgxScanResult::unavailable)
+        {
+            static bool said = false;
+            if (!said) { said = true; Log("NGX module discovery unavailable: loader-lock probe failed."); }
+            break;
+        }
+        if (acquired != NgxScanResult::acquired) continue;
         bool slot_available = g_layer_count < kMaxLayers;
         for (LONG k = 0; k < g_layer_count && !slot_available; ++k)
             slot_available = g_layer[k].mod == nullptr;
@@ -3658,6 +3674,8 @@ static bool ProcessPendingRetirements()
     return retired_all;
 }
 
+static void FgtMaintenance();
+
 static DWORD WINAPI HookWorkerProc(LPVOID module)
 {
     for (;;)
@@ -3668,14 +3686,16 @@ static DWORD WINAPI HookWorkerProc(LPVOID module)
             if (ProcessPendingRetirements())
             {
                 TryInstallHooks();
+                FgtMaintenance();
                 ReportIdle();
             }
             else
             {
                 InterlockedExchange(&g_scan_pending, 1);
-                Sleep(10); // Retry outside every lock; no render-thread wait.
             }
         }
+        // Back off outside all locks when discovery yields to a loader or render thread.
+        if (!g_shutting_down && InterlockedCompareExchange(&g_scan_pending, 0, 0)) Sleep(10);
         InterlockedExchange(&g_worker_running, 0);
         if (!g_shutting_down && InterlockedCompareExchange(&g_scan_pending, 0, 0) &&
             InterlockedCompareExchange(&g_worker_running, 1, 0) == 0) continue;
@@ -4074,6 +4094,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         // running DLL detach, so absence proves nothing and reporting it would
         // claim a crash on every ordinary launch.
         char carried[2048] = {};
+        bool carried_truncated = false;
         {
             FILE *old = nullptr;
             if (fopen_s(&old, g_log_path, "r") == 0 && old != nullptr)
@@ -4086,10 +4107,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
                     {
                         in_report = true;
                         carried[0] = '\0';
+                        carried_truncated = false;
                         continue;
                     }
                     if (in_report && strstr(line, "####") != nullptr) break;
-                    if (in_report) strcat_s(carried, line);
+                    if (in_report && !AppendCrashReport(carried, line))
+                        carried_truncated = true;
                 }
                 fclose(old);
             }
@@ -4107,6 +4130,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         {
             Log("The previous run crashed. What it recorded at the time:");
             Log("%s", carried);
+            if (carried_truncated) Log("[bridge] Previous crash report truncated safely at 2047 bytes.");
         }
 
         LogEnvironment();

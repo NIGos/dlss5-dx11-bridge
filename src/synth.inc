@@ -1211,6 +1211,7 @@ struct Synth12
 {
     bool tried;      // the session open was attempted; a failure is never retried
     bool ready;      // device, NGX session, queue, allocator ring
+    bool resources_retained;
 
     // The device is this add-on's own rather than the game's, so all four
     // textures have to be created shareable and the frame has to be carried
@@ -1359,19 +1360,35 @@ static void Synth12CopyF(const NVSDK_NGX_Parameter *src, NVSDK_NGX_Parameter *ds
 static bool Synth12WaitFence(UINT64 value, DWORD ms)
 {
     if (g_s12.fence == nullptr || g_s12.event == nullptr) return false;
-    if (g_s12.fence->GetCompletedValue() >= value) return true;
+    const UINT64 completed = g_s12.fence->GetCompletedValue();
+    if (completed == UINT64_MAX) return false;
+    if (completed >= value) return true;
     if (FAILED(g_s12.fence->SetEventOnCompletion(value, g_s12.event))) return false;
     if (WaitForSingleObject(g_s12.event, ms) != WAIT_OBJECT_0) return false;
-    return g_s12.fence->GetCompletedValue() >= value;
+    const UINT64 after = g_s12.fence->GetCompletedValue();
+    return after != UINT64_MAX && after >= value;
+}
+
+static bool Synth12Drain(DWORD wait_ms = 4000)
+{
+    if (g_s12.resources_retained) return false;
+    if ((g_s12.fence != nullptr && !Synth12WaitFence(g_s12.fence_value, wait_ms)) ||
+        !PqPassWait(&g_s12.pq, g_s12.pq.fv, wait_ms)) {
+        g_s12.resources_retained = true;
+        g_s12.ready = false;
+        Log("[synth] GPU completion unproven; retaining the private feature, images and colour-pass resources.");
+        return false;
+    }
+    return true;
 }
 
 // D3D12 keeps no reference to the resources a submitted command list names, so
 // the last frame has to be finished with before any of them is freed. This runs
 // on a resolution change, which is rare enough that a full wait costs nothing
 // and a use-after-free costs a GPU reset.
-static void Synth12ReleaseTextures()
+static bool Synth12ReleaseTextures()
 {
-    Synth12WaitFence(g_s12.fence_value, 4000);
+    if (!Synth12Drain()) return false;
     if (g_s12.feature != nullptr && g_s12.release_feature != nullptr)
         g_s12.release_feature(g_s12.feature);
     g_s12.feature = nullptr;
@@ -1430,7 +1447,7 @@ static void Synth12ReleaseTextures()
     if (g_s12.cvt_heap  != nullptr) { g_s12.cvt_heap->Release();  g_s12.cvt_heap  = nullptr; }
     if (g_s12.cvt_pso   != nullptr) { g_s12.cvt_pso->Release();   g_s12.cvt_pso   = nullptr; }
     if (g_s12.cvt_rs    != nullptr) { g_s12.cvt_rs->Release();    g_s12.cvt_rs    = nullptr; }
-    PqPassRelease(&g_s12.pq);
+    return PqPassRelease(&g_s12.pq);
 }
 
 // wait_ms is how long the command allocator's own retire fence is waited for,
@@ -2009,9 +2026,10 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
                          DXGI_FORMAT back_fmt, bool depth_packed = false,
                          UINT exp_w = 0, UINT exp_h = 0, bool out_pair = false,
                          DXGI_FORMAT exp_fmt = DXGI_FORMAT_R32_FLOAT,
-                         DXGI_FORMAT output_fmt = DXGI_FORMAT_UNKNOWN)
+                         DXGI_FORMAT output_fmt = DXGI_FORMAT_UNKNOWN,
+                         bool srgb = false, bool hdr10 = false)
 {
-    Synth12ReleaseTextures();
+    if (!Synth12ReleaseTextures()) return false;
     g_s12.w = w; g_s12.h = h; g_s12.fmt = back_fmt;
     g_s12.out_w = out_w; g_s12.out_h = out_h;
     g_s12.depth_packed = depth_packed;
@@ -2020,7 +2038,7 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
     // when the frame has to cross into this device, because then they are not
     // the game's resources any more but copies of them.
     const DXGI_FORMAT slot_fmt[SLOT_COUNT] = {
-        TypedFormat(back_fmt),
+        srgb ? Synth12UavFormat(back_fmt) : TypedFormat(back_fmt),
         Synth12UavFormat(output_fmt == DXGI_FORMAT_UNKNOWN ? back_fmt : output_fmt),
         // R32_FLOAT rather than any depth format: a depth-stencil resource is
         // not in the kernel's shared-format list, and NGX reads depth through
@@ -2086,9 +2104,9 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
     // passes no exp_w and no depth_packed, so on the one transport that pipelines
     // there is nothing to double.
     if (g_s12.shared && InterlockedCompareExchange(&g_source, 0, 0) != SRC_MIRROR &&
-        PqBackBuffer(back_fmt) &&
+        (PqBackBuffer(back_fmt) || srgb || hdr10) &&
         !PqPassMake(&g_s12.pq, g_s12.dev, g_s12.tex[SLOT_COLOR], g_s12.tex[SLOT_OUTPUT],
-                    g_s12.tex[kOutB]))
+                    g_s12.tex[kOutB], srgb))
     { Synth12ReleaseTextures(); return false; }
 
     Log("[synth] colour in %s, output %s -- the frame is copied into the first and the "
@@ -2600,7 +2618,8 @@ static ID3D12Resource *SynthOfaVkMvTexture();
 // pipelined transport's worker, which alternates it with kOutB so the game can
 // copy the previous frame's result out of the other one while this runs.
 static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
-                                  int out_slot = SLOT_OUTPUT, bool *wrote_out = nullptr)
+                                  int out_slot = SLOT_OUTPUT, bool *wrote_out = nullptr,
+                                  bool wait_completion = true)
 {
     // ONE observation of mode, taken before anything else and handed back, and
     // the reason is that two reads of it disagree. "Did an evaluate write this
@@ -2732,12 +2751,15 @@ static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
         Barrier(g_s12.list, g_s12.depth_cvt, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_COMMON);
     UINT64 v = Synth12End();
-    if (g_s12.pq.in != nullptr)
-        // The encode has to land in the Output this frame's evaluate belongs to,
-        // which under the pipeline alternates. The decode does not: colour is one
-        // texture in every mode.
-        v = PqPassAfter(&g_s12.pq, g_s12.queue, g_s12.fence, &g_s12.fence_value, v,
-                        out_slot == SLOT_OUTPUT ? 0 : 1, wait_ms);
+    if (g_s12.pq.in != nullptr) {
+        const UINT64 encoded = PqPassAfter(&g_s12.pq, g_s12.queue, g_s12.fence, &g_s12.fence_value, v,
+                                          out_slot == SLOT_OUTPUT ? 0 : 1, wait_ms);
+        if (encoded == v) {
+            Log("[synth] output encoding failed; the completed NR submission is not an encoded output.");
+            return false;
+        }
+        v = encoded;
+    }
 
     if (code != 0)
     {
@@ -2827,7 +2849,11 @@ static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
     // vkCmdWaitEvents until this returns, and Windows resets a device that stops
     // for two seconds -- so both pass a shorter one and give up inside the TDR
     // window.
-    if (!Synth12WaitFence(v, wait_ms))
+    // The GPU relay (Pipeline=2/3) asks for the submission without this wait: its
+    // release is signalled on this same D3D12 queue, so nothing on this thread
+    // has to observe the completion -- the next frame's Synth12Begin waits the
+    // allocator's retire fence, which is this submission's own fence value.
+    if (wait_completion && !Synth12WaitFence(v, wait_ms))
     {
         // What "stops" means depends on who is reading. This backend records no
         // further frame, and the CPU readback the D3D11 path makes really is not
@@ -2871,8 +2897,11 @@ static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
 // this transport does not use -- VK_KHR_external_semaphore_win32, the
 // shared-fence import -- and cost the two hazards the note above HookRemove in
 // DllMain names: a second thread through the window where the original bytes are
-// back, and a jump left in place across an unload. There is no Vulkan hook to
-// remove on detach because there is none to install.
+// back, and a jump left in place across an unload. This transport installs no
+// Vulkan hook at all, and nothing is removed on detach because nothing was
+// installed. The relay is the one part of this add-on that does install one:
+// with Pipeline 2 or 3 and Import=1, fg-relay.inc patches this same vkCreateDevice
+// to append that one extension, for an import this transport does not take.
 //
 // The price of not importing the fence is that the two queues are ordered by
 // something other than a shared fence. That used to be the CPU -- ReShade's queue
@@ -2891,8 +2920,10 @@ static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
 // upgrade is importing g_s12.fence as a Vulkan timeline semaphore -- a D3D12
 // fence and a timeline semaphore are the same object, and g_s12.fence would only
 // have to be created D3D12_FENCE_FLAG_SHARED -- which needs
-// VK_KHR_external_semaphore_win32, which ReShade does not enable, which is what
-// would need the hook.
+// VK_KHR_external_semaphore_win32. ReShade does not enable it, so the extension
+// has to be added at device creation for a device to carry it at all; with
+// Pipeline 2 or 3 and Import=1 the relay's create-device hook is what adds it,
+// and the import below is still this transport's own decision to take or not.
 //
 // Every Vulkan entry point is resolved through vkGetDeviceProcAddr out of a
 // LoadLibrary of vulkan-1.dll. There is deliberately no import of it: a D3D11
@@ -7426,7 +7457,15 @@ static void SynthVkShutdownForDevice()
         return;
     }
     Breadcrumb("shutdown: waiting the game's Vulkan queue idle");
-    if (g_svk.DeviceWaitIdle != nullptr) g_svk.DeviceWaitIdle(g_svk.dev);
+    const bool vulkan_idle = g_svk.DeviceWaitIdle != nullptr && g_svk.DeviceWaitIdle(g_svk.dev) == 0;
+    if (!vulkan_idle || !Synth12Drain()) {
+        g_s12.resources_retained = true;
+        g_s12.ready = false;
+        g_svk.ready = false;
+        g_svk.dev = nullptr;
+        Log("[synth] shutdown completion unproven; retaining imported images and private resources.");
+        return;
+    }
 
     // And only now the four park events, for the reason SynthVkParkStop's header
     // gives: setting an event does not retire the queued vkCmdWaitEvents that
@@ -8219,9 +8258,28 @@ static void SynthForget()
 
 // The colour space the game presents in, as ReShade reads it off the swapchain
 // it just created or resized. Kept for the feature-build line and the panel.
+struct PresentSwapchainContract {
+    reshade::api::device* device;
+    void* window;
+    uint64_t first_buffer;
+    reshade::api::color_space space;
+};
+static std::mutex g_present_swapchain_mutex;
+static PresentSwapchainContract g_present_swapchain = {};
+
 static void OnSynthInitSwapchain(reshade::api::swapchain *sc, bool)
 {
-    if (sc != nullptr) InterlockedExchange(&g_present_space, static_cast<LONG>(sc->get_color_space()));
+    if (sc == nullptr) return;
+    const auto space = sc->get_color_space();
+    InterlockedExchange(&g_present_space, static_cast<LONG>(space));
+    if (PresentationAdapterEnabled() && sc->get_device()->get_api() == reshade::api::device_api::vulkan) {
+        const PresentSwapchainContract observed = {
+            sc->get_device(), sc->get_hwnd(),
+            sc->get_back_buffer_count() != 0 ? sc->get_back_buffer(0).handle : 0, space
+        };
+        std::lock_guard<std::mutex> lock(g_present_swapchain_mutex);
+        g_present_swapchain = observed;
+    }
 }
 
 static void OnSynthInitEffectRuntime(reshade::api::effect_runtime *)
@@ -8467,6 +8525,8 @@ static void SynthReleaseLatch(ULONGLONG quiet_ms)
             "releases are not reported. The status panel shows which source is running now.");
 }
 
+#include "present-adapter.inc"
+
 static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
                                 reshade::api::command_list   *cmd,
                                 reshade::api::resource_view   rtv,
@@ -8480,10 +8540,18 @@ static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
     // nothing else runs the D3D11 frame path, so a key the panel wrote --
     // synth=1 from the switch -- stayed unread until the game's DLSS came back,
     // and the switch read as unticked one frame after every click. Rate
-    // limited inside; under g_bridge_cs like the other call sites.
-    EnterCriticalSection(&g_bridge_cs);
-    CfgReload();
-    LeaveCriticalSection(&g_bridge_cs);
+    // limited inside; still protected by g_bridge_cs, but this optional poll
+    // must not block the frame-generation/present thread. Endfield's Vulkan
+    // mirror can hold this lock while waiting for its worker, whose GPU input
+    // is queued behind FG completion. ETW confirmed that blocking this callback
+    // closes that wait cycle until the worker's 300 ms timeout fires.
+    if (!TryReloadPresentConfig(g_bridge_cs, [] { CfgReload(); })) return;
+
+    if (PresentationAdapterEnabled())
+    {
+        PresentAdapterFrame(rt, cmd, rtv);
+        return;
+    }
 
     if (!SynthEnabled() || rt == nullptr || cmd == nullptr) return;
 

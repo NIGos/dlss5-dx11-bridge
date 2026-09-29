@@ -7,3 +7,5 @@
 *.log
 *.cfg
 /src/dlss5-bridge.addon64
+/tests/*/build/
+/tests/*/*/build/

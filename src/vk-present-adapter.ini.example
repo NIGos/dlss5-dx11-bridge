@@ -1,0 +1,34 @@
+[Adapter]
+; Experimental, restart-only. No frames run until a fresh request is written.
+Enabled=0
+; Source=fg-input processes the real frame at the native frame-generation input.
+;Source=fg-input
+; Pipeline=0 parks the FG evaluate on the real frame's NR (default).
+; Pipeline=1 runs the same NR concurrently and discards it (throughput probe; picture carries no NR).
+; Pipeline=2/3 hand the synchronisation to the GPU relay: the copies become this add-on's
+;  own Vulkan batch and the park is released as soon as the private D3D12 work is done.
+;  2 copies at the FG evaluate (on DLSSG.CmdQueue); 3 copies at the game's vkQueuePresentKHR,
+;  ~5 ms earlier. The relay opens only after the serial feed has built the private session;
+;  once open it owns every frame (a frame it cannot arm is FG's own image for one group).
+;Pipeline=0
+; Import=1 lets the relay release the park on the GPU through a D3D12 fence imported as a
+;  Vulkan timeline semaphore, and has the add-on add VK_KHR_external_semaphore_win32 to the
+;  game's device at creation (a hook on the ReShade layer's vkCreateDevice that appends the
+;  name to a copy of the create info; a driver that refuses the name gets the caller's own
+;  list retried unchanged, so device creation cannot fail because of it). The import is used
+;  only for a device that create accepted the name on; every other device keeps the host
+;  release. A non-null vkGetDeviceProcAddr answer for the two KHR entry points is not proof
+;  the device carries the extension, so they are never called on one that was not shown to.
+;  Off by default.
+;Import=0
+; Throttle=N (relay with Import=1 only; default 1, 0 off, at most 3) holds the game at the
+;  top of its frame (after slReflexSleep, before input and simulation) until the NR of the
+;  newest armed frame, less N-1 frames, has completed; a game that never calls slReflexSleep
+;  is held at its vkQueuePresentKHR instead, which removes the queue but not the latency.
+;  Reflex cannot see the NR on the private D3D12 queue, so without this a GPU-bound game runs
+;  ahead and frames queue in front of the NR, which shows as input latency. Waits are bounded
+;  (100 ms) and the throttle turns itself off after five consecutive timeouts.
+;Throttle=1
+; Trace=1 adds pass-through observers (game present, slSetTag, queue submits, FG handles) to the log.
+; Asynchronous bounded logging; no rendering parameter changes. Restart required.
+;Trace=0
