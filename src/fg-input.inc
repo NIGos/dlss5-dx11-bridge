@@ -42,10 +42,98 @@ struct FgInputState {
     uint32_t vk_fmt;
     UINT w, h;
     VkmRes hudless, back;
-    unsigned frames, writes, skipped_nr;
+    unsigned frames, writes, skipped_nr, busy_skips;
+    volatile LONG eval_calls, eval_index_skipped;
     unsigned long long token;
+    unsigned census_left;
 };
 static FgInputState g_fg_input;
+
+// Every key the game's sl.dlss_g.dll (Streamline 2.14.1) can place in the FG
+// parameter block. A one-frame-delayed pipeline has to snapshot whichever of
+// these change per frame, so the first evaluates log which type each key
+// answers to and its value.
+static const char *const kFgCensusKeys[] = {
+    "DLSSG.AutomodeOverrideReset", "DLSSG.Backbuffer", "DLSSG.BackbufferFormat", "DLSSG.BackbufferFrameID",
+    "DLSSG.BackbufferSubrectBaseX", "DLSSG.BackbufferSubrectBaseY", "DLSSG.BackbufferSubrectHeight",
+    "DLSSG.BackbufferSubrectWidth", "DLSSG.BidirectionalDistortionField",
+    "DLSSG.BidirectionalDistortionFieldLowPrecision.Bias", "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision",
+    "DLSSG.BidirectionalDistortionFieldLowPrecision.Scale", "DLSSG.BidirectionalDistortionFieldSubrectBaseX",
+    "DLSSG.BidirectionalDistortionFieldSubrectBaseY", "DLSSG.BidirectionalDistortionFieldSubrectHeight",
+    "DLSSG.BidirectionalDistortionFieldSubrectWidth", "DLSSG.CameraAspectRatio", "DLSSG.CameraFOV", "DLSSG.CameraFar",
+    "DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ", "DLSSG.CameraMotionIncluded", "DLSSG.CameraNear",
+    "DLSSG.CameraPinholeOffsetX", "DLSSG.CameraPinholeOffsetY", "DLSSG.CameraPosX", "DLSSG.CameraPosY", "DLSSG.CameraPosZ",
+    "DLSSG.CameraRightX", "DLSSG.CameraRightY", "DLSSG.CameraRightZ", "DLSSG.CameraUpX", "DLSSG.CameraUpY", "DLSSG.CameraUpZ",
+    "DLSSG.CameraViewToClip", "DLSSG.ClipToCameraView", "DLSSG.ClipToLensClip", "DLSSG.ClipToPrevClip", "DLSSG.CmdAlloc",
+    "DLSSG.CmdQueue", "DLSSG.ColorBuffersHDR", "DLSSG.Depth", "DLSSG.DepthInverted", "DLSSG.DepthSubrectBaseX",
+    "DLSSG.DepthSubrectBaseY", "DLSSG.DepthSubrectHeight", "DLSSG.DepthSubrectWidth", "DLSSG.Dynamic.ReflexDriven",
+    "DLSSG.DynamicMaxFrameCount", "DLSSG.DynamicResolution", "DLSSG.EnableInterp", "DLSSG.EstimateVRAMCallback",
+    "DLSSG.EvalFlags", "DLSSG.FenceEvent", "DLSSG.FlipMetering", "DLSSG.FullscreenMode", "DLSSG.HUDLess",
+    "DLSSG.HUDLessSubrectBaseX", "DLSSG.HUDLessSubrectBaseY", "DLSSG.HUDLessSubrectHeight", "DLSSG.HUDLessSubrectWidth",
+    "DLSSG.Height", "DLSSG.InternalHeight", "DLSSG.InternalWidth", "DLSSG.IsRecording", "DLSSG.JitterOffsetX",
+    "DLSSG.JitterOffsetY", "DLSSG.MVecs", "DLSSG.MVecsSubrectBaseX", "DLSSG.MVecsSubrectBaseY", "DLSSG.MVecsSubrectHeight",
+    "DLSSG.MVecsSubrectWidth", "DLSSG.MenuDetectionEnabled", "DLSSG.MinRelativeLinearDepthObjectSeparation",
+    "DLSSG.ModelVersion", "DLSSG.MultiFrameCount", "DLSSG.MultiFrameCountMax", "DLSSG.MultiFrameIndex", "DLSSG.MvecDilated",
+    "DLSSG.MvecInvalidValue", "DLSSG.MvecJittered", "DLSSG.MvecScaleX", "DLSSG.MvecScaleY", "DLSSG.NoWarp",
+    "DLSSG.NoWarpSubrectBaseX", "DLSSG.NoWarpSubrectBaseY", "DLSSG.NoWarpSubrectHeight", "DLSSG.NoWarpSubrectWidth",
+    "DLSSG.NotRenderingGameFrames", "DLSSG.NvAppOvrAppliedVal.MultiFrameCount", "DLSSG.NvAppOvrAppliedVal.StreamlineMode",
+    "DLSSG.OrthoProjection", "DLSSG.OutputDisableInterpolation", "DLSSG.OutputInterpolated", "DLSSG.OutputReal",
+    "DLSSG.PrevClipToClip", "DLSSG.QueueSubmitCallback", "DLSSG.QueueSubmitCallbackData", "DLSSG.RefreshRate", "DLSSG.Reset",
+    "DLSSG.StreamlineMode", "DLSSG.StreamlineVersionTag", "DLSSG.SyncFlushCallback", "DLSSG.SyncFlushCallbackData",
+    "DLSSG.SyncSignalCallback", "DLSSG.SyncSignalCallbackData", "DLSSG.SyncSignalOnlyCallback", "DLSSG.SyncSignalOnlyCallbackData",
+    "DLSSG.SyncWaitCallback", "DLSSG.SyncWaitCallbackData", "DLSSG.SyncWaitOnlyCallback", "DLSSG.SyncWaitOnlyCallbackData",
+    "DLSSG.TargetFrameRate", "DLSSG.UI", "DLSSG.UIAlpha", "DLSSG.UIAlphaSubrectBaseX", "DLSSG.UIAlphaSubrectBaseY",
+    "DLSSG.UIAlphaSubrectHeight", "DLSSG.UIAlphaSubrectWidth", "DLSSG.UISubrectBaseX", "DLSSG.UISubrectBaseY",
+    "DLSSG.UISubrectHeight", "DLSSG.UISubrectWidth", "DLSSG.UserInterfaceRecompositionEnabled", "DLSSG.VSyncDriverRequested",
+    "DLSSG.VSyncOn", "DLSSG.VSyncSupported", "DLSSG.VkOFAModeRequest", "DLSSG.Width", "DLSSG.run_lowres_mvec_pass",
+};
+
+static bool FgCensusReadFloats(const void *src, float *dst, size_t n)
+{
+    __try { memcpy(dst, src, n * sizeof(float)); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static void FgCensusAppend(char *line, size_t cap, size_t *len, const char *fmt, ...)
+{
+    if (*len >= cap - 1) return;
+    va_list args;
+    va_start(args, fmt);
+    const int n = _vsnprintf_s(line + *len, cap - *len, _TRUNCATE, fmt, args);
+    va_end(args);
+    *len = n < 0 ? cap - 1 : *len + static_cast<size_t>(n);
+}
+
+static void FgInputCensus(const NVSDK_NGX_Parameter *p, unsigned pass)
+{
+    Log("[fg-census] pass %u begins: %u keys, types tried u/i/f/d/ull/ptr.", pass, static_cast<unsigned>(_countof(kFgCensusKeys)));
+    for (size_t k = 0; k < _countof(kFgCensusKeys); ++k) {
+        const char *key = kFgCensusKeys[k];
+        char line[640];
+        size_t len = 0;
+        FgCensusAppend(line, sizeof(line), &len, "[fg-census] %s", key);
+        bool any = false;
+        unsigned u = 0; int i = 0; float f = 0.0f; double d = 0.0; unsigned long long ull = 0; void *ptr = nullptr;
+        if (p->Get(key, &u) == NGX_SUCCESS)   { FgCensusAppend(line, sizeof(line), &len, " u=%u", u); any = true; }
+        if (p->Get(key, &i) == NGX_SUCCESS)   { FgCensusAppend(line, sizeof(line), &len, " i=%d", i); any = true; }
+        if (p->Get(key, &f) == NGX_SUCCESS)   { FgCensusAppend(line, sizeof(line), &len, " f=%.6g", f); any = true; }
+        if (p->Get(key, &d) == NGX_SUCCESS)   { FgCensusAppend(line, sizeof(line), &len, " d=%.9g", d); any = true; }
+        if (p->Get(key, &ull) == NGX_SUCCESS) { FgCensusAppend(line, sizeof(line), &len, " ull=%llu", ull); any = true; }
+        if (p->Get(key, &ptr) == NGX_SUCCESS) {
+            FgCensusAppend(line, sizeof(line), &len, " ptr=%p", ptr);
+            any = true;
+            if (ptr != nullptr && strstr(key, "Clip") != nullptr) {
+                float m[16] = {};
+                if (FgCensusReadFloats(ptr, m, 16))
+                    FgCensusAppend(line, sizeof(line), &len,
+                                   " m=[%.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g]",
+                                   m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+            }
+        }
+        if (any) Log("%s", line);
+    }
+    Log("[fg-census] pass %u ends.", pass);
+}
 
 static bool FgCompositeWait(DWORD ms)
 {
@@ -152,7 +240,9 @@ static bool FgCompositeMake(ID3D12Device *dev, ID3D12Resource *hudless, ID3D12Re
 }
 
 // Runs on the private queue after the NR submission; the caller fences on it.
-static bool FgCompositeRun(ID3D12CommandQueue *queue, DWORD wait_ms)
+// wait_done is false on the relay's path, where the completion is consumed by the
+// D3D12 queue's own release signal rather than by this thread.
+static bool FgCompositeRun(ID3D12CommandQueue *queue, DWORD wait_ms, bool wait_done = true)
 {
     FgComposite &c = g_fg_composite;
     if (c.pso == nullptr || c.back == nullptr) return false;
@@ -175,6 +265,7 @@ static bool FgCompositeRun(ID3D12CommandQueue *queue, DWORD wait_ms)
     ID3D12CommandList *lists[] = { c.list };
     queue->ExecuteCommandLists(1, lists);
     if (FAILED(queue->Signal(c.fence, ++c.fv))) return false;
+    if (!wait_done) return true;
     return FgCompositeWait(wait_ms);
 }
 
@@ -225,13 +316,14 @@ static bool FgInputWorker()
     if (ok && !nr_absent) ++g_fg_input.writes;
     const unsigned cadence = g_present_adapter.continuous ? 1800u : 120u;
     if (g_fg_input.frames <= 3 || g_fg_input.frames % cadence == 0 || !ok || g_present_adapter.remaining == 0)
-        Log("[fg-input] frame=%u %ux%u vkfmt=%u mode=%s nr_entries=%u sr_entries=%u sr_copies=%u ok=%d token=%llu.",
+        Log("[fg-input] frame=%u %ux%u vkfmt=%u mode=%s pipeline=%s nr_entries=%u sr_entries=%u sr_copies=%u ok=%d busy_skips=%u token=%llu.",
             g_fg_input.frames, g_fg_input.w, g_fg_input.h, g_fg_input.vk_fmt,
             g_present_adapter.run_nr ? "NR" : g_present_adapter.colour_roundtrip ? "carrier" : "copy",
-            nr_entries, sr_entries, sr_copies, ok ? 1 : 0, g_present_adapter.token);
+            PresentAdapterPipeline() == 1 ? "probe(discarded)" : "serial",
+            nr_entries, sr_entries, sr_copies, ok ? 1 : 0, g_fg_input.busy_skips, g_present_adapter.token);
     if (g_present_adapter.remaining == 0)
-        Log("[fg-input] request complete: frames=%u writes=%u no_nr=%u. token=%llu",
-            g_fg_input.frames, g_fg_input.writes, g_fg_input.skipped_nr, g_present_adapter.token);
+        Log("[fg-input] request complete: frames=%u writes=%u no_nr=%u busy_skips=%u. token=%llu",
+            g_fg_input.frames, g_fg_input.writes, g_fg_input.skipped_nr, g_fg_input.busy_skips, g_present_adapter.token);
     return ok;
 }
 
@@ -256,10 +348,14 @@ static bool FgInputReadU(const NVSDK_NGX_Parameter *p, const char *key, unsigned
 // other path can build. Returns false and keeps everything when completion is unproven.
 static bool FgInputRelease()
 {
+    // A relay frame still armed or still being consumed owns the staging images
+    // and a parked command buffer; the release refuses rather than races it.
+    if (PresentAdapterRelay() && !FgRelayIdleForRelease()) return false;
     if (g_vkm.idle != nullptr && WaitForSingleObject(g_vkm.idle, kVkmIdleMs) != WAIT_OBJECT_0) return false;
     if (!FgCompositeWait(4000)) return false;
     if (!Synth12Drain(4000)) return false;
     if (g_svk.dev != nullptr && g_svk.DeviceWaitIdle != nullptr && g_svk.DeviceWaitIdle(g_svk.dev) != 0) return false;
+    if (PresentAdapterRelay()) FgRelayOnSessionRelease();
     SynthVkReleaseImages();
     if (!Synth12ReleaseTextures()) return false;
     g_fg_composite.hudless = g_fg_composite.nr = g_fg_composite.back = nullptr;
@@ -295,6 +391,7 @@ static bool MirrorReleaseForFgInput()
 // forwarded -- so FG and the real-frame present both see the processed image.
 static void FgInputFrame(void *cmd_raw, const NVSDK_NGX_Parameter *p)
 {
+    InterlockedIncrement(&g_fg_input.eval_calls);
     if (g_fg_input.refused || g_vkm.stopping || g_cfg.stage < 2) return;
     if (!FgInputActive()) return;
     if (InterlockedCompareExchange(&g_adapter_owner, 0, 0) == OWNER_MIRROR) return;
@@ -309,9 +406,17 @@ static void FgInputFrame(void *cmd_raw, const NVSDK_NGX_Parameter *p)
         g_present_adapter.deadline = ULLONG_MAX;
         g_present_adapter.token = 1;
         g_s12.need_reset = true;
-        Log("[fg-input] AutoRun: continuous NR at the frame-generation input; a request with frames=0 stops it.");
+        Log("[fg-input] AutoRun: continuous NR at the frame-generation input; a request with frames=0 stops it. pipeline=%s",
+            PresentAdapterPipeline() == 1 ? "probe (NR concurrent, result discarded, picture carries no NR)" : "serial park");
     }
     if (g_present_adapter.remaining == 0 || g_present_adapter.refused) return;
+    if (g_fg_input.census_left != 0) {
+        unsigned idx = 0;
+        FgInputReadU(p, "DLSSG.MultiFrameIndex", &idx);
+        Log("[fg-census] evaluate observed: MultiFrameIndex=%u thread=%lu", idx, GetCurrentThreadId());
+        FgInputCensus(p, 4 - g_fg_input.census_left);
+        --g_fg_input.census_left;
+    }
     if (GetTickCount64() >= g_present_adapter.deadline) {
         Log("[fg-input] request complete: frames=%u writes=%u no_nr=%u (deadline). token=%llu",
             g_fg_input.frames, g_fg_input.writes, g_fg_input.skipped_nr, g_present_adapter.token);
@@ -319,11 +424,16 @@ static void FgInputFrame(void *cmd_raw, const NVSDK_NGX_Parameter *p)
     }
     if (g_present_adapter.token != g_fg_input.token) {
         g_fg_input.token = g_present_adapter.token;
-        g_fg_input.frames = g_fg_input.writes = g_fg_input.skipped_nr = 0;
+        g_fg_input.frames = g_fg_input.writes = g_fg_input.skipped_nr = g_fg_input.busy_skips = 0;
+        static bool census_ran;
+        if (!census_ran) { census_ran = true; g_fg_input.census_left = 3; }
     }
     unsigned index = 0;
     const bool indexed = FgInputReadU(p, "DLSSG.MultiFrameIndex", &index);
-    if (indexed && index != 1) return;
+    if (indexed && index != 1) {
+        InterlockedIncrement(&g_fg_input.eval_index_skipped);
+        return;
+    }
     if (!indexed) {
         // Without an index, the real-output slot marks the first evaluate of a group.
         const char *why_real = nullptr;
@@ -332,6 +442,15 @@ static void FgInputFrame(void *cmd_raw, const NVSDK_NGX_Parameter *p)
     }
     if (!PresentAdapterConfiguration()) { g_present_adapter.remaining = 0; g_present_adapter.refused = true; return; }
     if (g_cfg.mode != 2) { FgInputRefuse("the experiment requires Bridge mode=2"); return; }
+    if (PresentAdapterRelay())
+    {
+        // The relay owns the frames it arms: it records the park and the copy
+        // back against the copy the present (Pipeline=3) or this evaluate
+        // (Pipeline=2) already submitted. 0 means it has nothing for this frame
+        // and the serial feed below runs as it always has.
+        const int rel = FgRelayEvaluate(cmd_raw, p);
+        if (rel != 0) return;
+    }
     if (g_vkm_rt == nullptr) return;
     reshade::api::device *rdev = g_vkm_rt->get_device();
     if (rdev == nullptr || rdev->get_api() != reshade::api::device_api::vulkan) return;
@@ -371,7 +490,12 @@ static void FgInputFrame(void *cmd_raw, const NVSDK_NGX_Parameter *p)
     }
     FgInputReadU(p, "DLSSG.DepthInverted", &depth_inverted);
     if (!VkmEnsureEvents()) return;
-    if (g_vkm.idle != nullptr && WaitForSingleObject(g_vkm.idle, kVkmIdleMs) != WAIT_OBJECT_0) {
+    const bool probe = PresentAdapterPipeline() == 1;
+    if (probe) {
+        // Concurrent by design: a frame that arrives while the previous NR is still
+        // running is skipped and counted, never waited for.
+        if (g_vkm.idle != nullptr && WaitForSingleObject(g_vkm.idle, 0) != WAIT_OBJECT_0) { ++g_fg_input.busy_skips; return; }
+    } else if (g_vkm.idle != nullptr && WaitForSingleObject(g_vkm.idle, kVkmIdleMs) != WAIT_OBJECT_0) {
         FgInputRefuse("the previous frame's park had not cleared"); return;
     }
     if (g_vkm.refused) return;
@@ -464,6 +588,9 @@ static void FgInputFrame(void *cmd_raw, const NVSDK_NGX_Parameter *p)
     g_vkm.fg_arm = true;
     --g_present_adapter.remaining;
     SetEvent(g_vkm.wake);
+    // Probe: no park and no copy back. FG proceeds on the game's own image while the
+    // private device runs NR on the copies; the picture carries no NR for the run.
+    if (probe) return;
     {
         SVkMemoryBarrier mb = {};
         mb.sType = kSVkStMemoryBarrier;

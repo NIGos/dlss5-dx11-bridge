@@ -41,6 +41,7 @@
 #include <windows.h>
 #include <MinHook.h>
 #include "module-lifetime.h"
+#include "ngx-module-scan.h"
 // SHA-256 for identifying a neighbour build whose version resource does not.
 #include <bcrypt.h>
 #include <d3d11.h>
@@ -65,7 +66,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.4.13-pre8-vk-fginput"
+#define BRIDGE_VERSION "1.4.13-pre8-vk-fgrelay"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 Bridge " BRIDGE_VERSION;
@@ -2641,16 +2642,16 @@ static volatile bool g_shutting_down = false;
 // reference can run arbitrary DLL_PROCESS_DETACH code and acquire other locks.
 struct ScanModuleRefs
 {
+    NgxModuleScanner scanner;
     HMODULE modules[1024] = {};
     DWORD count = 0;
-    bool Acquire(HMODULE module)
+    NgxScanResult Acquire(HMODULE module)
     {
-        if (count == _countof(modules)) return false;
+        if (count == _countof(modules)) return NgxScanResult::skipped;
         HMODULE held = nullptr;
-        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                reinterpret_cast<LPCWSTR>(module), &held)) return false;
-        modules[count++] = held;
-        return true;
+        const NgxScanResult result = scanner.Acquire(module, g_vk_mirror != 0, held);
+        if (result == NgxScanResult::acquired) modules[count++] = held;
+        return result;
     }
     ~ScanModuleRefs()
     {
@@ -2676,7 +2677,19 @@ static int HookNewNgxModules(ScanModuleRefs &held)
     for (DWORD i = 0; i < count; ++i)
     {
         if (g_shutting_down) break;
-        if (!held.Acquire(mods[i])) continue;
+        const NgxScanResult acquired = held.Acquire(mods[i]);
+        if (acquired == NgxScanResult::retry)
+        {
+            InterlockedExchange(&g_scan_pending, 1);
+            break;
+        }
+        if (acquired == NgxScanResult::unavailable)
+        {
+            static bool said = false;
+            if (!said) { said = true; Log("NGX module discovery unavailable: loader-lock probe failed."); }
+            break;
+        }
+        if (acquired != NgxScanResult::acquired) continue;
         bool slot_available = g_layer_count < kMaxLayers;
         for (LONG k = 0; k < g_layer_count && !slot_available; ++k)
             slot_available = g_layer[k].mod == nullptr;
@@ -3661,6 +3674,8 @@ static bool ProcessPendingRetirements()
     return retired_all;
 }
 
+static void FgtMaintenance();
+
 static DWORD WINAPI HookWorkerProc(LPVOID module)
 {
     for (;;)
@@ -3671,14 +3686,16 @@ static DWORD WINAPI HookWorkerProc(LPVOID module)
             if (ProcessPendingRetirements())
             {
                 TryInstallHooks();
+                FgtMaintenance();
                 ReportIdle();
             }
             else
             {
                 InterlockedExchange(&g_scan_pending, 1);
-                Sleep(10); // Retry outside every lock; no render-thread wait.
             }
         }
+        // Back off outside all locks when discovery yields to a loader or render thread.
+        if (!g_shutting_down && InterlockedCompareExchange(&g_scan_pending, 0, 0)) Sleep(10);
         InterlockedExchange(&g_worker_running, 0);
         if (!g_shutting_down && InterlockedCompareExchange(&g_scan_pending, 0, 0) &&
             InterlockedCompareExchange(&g_worker_running, 1, 0) == 0) continue;

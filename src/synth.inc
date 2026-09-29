@@ -2618,7 +2618,8 @@ static ID3D12Resource *SynthOfaVkMvTexture();
 // pipelined transport's worker, which alternates it with kOutB so the game can
 // copy the previous frame's result out of the other one while this runs.
 static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
-                                  int out_slot = SLOT_OUTPUT, bool *wrote_out = nullptr)
+                                  int out_slot = SLOT_OUTPUT, bool *wrote_out = nullptr,
+                                  bool wait_completion = true)
 {
     // ONE observation of mode, taken before anything else and handed back, and
     // the reason is that two reads of it disagree. "Did an evaluate write this
@@ -2848,7 +2849,11 @@ static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
     // vkCmdWaitEvents until this returns, and Windows resets a device that stops
     // for two seconds -- so both pass a shorter one and give up inside the TDR
     // window.
-    if (!Synth12WaitFence(v, wait_ms))
+    // The GPU relay (Pipeline=2/3) asks for the submission without this wait: its
+    // release is signalled on this same D3D12 queue, so nothing on this thread
+    // has to observe the completion -- the next frame's Synth12Begin waits the
+    // allocator's retire fence, which is this submission's own fence value.
+    if (wait_completion && !Synth12WaitFence(v, wait_ms))
     {
         // What "stops" means depends on who is reading. This backend records no
         // further frame, and the CPU readback the D3D11 path makes really is not
@@ -2892,8 +2897,11 @@ static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
 // this transport does not use -- VK_KHR_external_semaphore_win32, the
 // shared-fence import -- and cost the two hazards the note above HookRemove in
 // DllMain names: a second thread through the window where the original bytes are
-// back, and a jump left in place across an unload. There is no Vulkan hook to
-// remove on detach because there is none to install.
+// back, and a jump left in place across an unload. This transport installs no
+// Vulkan hook at all, and nothing is removed on detach because nothing was
+// installed. The relay is the one part of this add-on that does install one:
+// with Pipeline 2 or 3 and Import=1, fg-relay.inc patches this same vkCreateDevice
+// to append that one extension, for an import this transport does not take.
 //
 // The price of not importing the fence is that the two queues are ordered by
 // something other than a shared fence. That used to be the CPU -- ReShade's queue
@@ -2912,8 +2920,10 @@ static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
 // upgrade is importing g_s12.fence as a Vulkan timeline semaphore -- a D3D12
 // fence and a timeline semaphore are the same object, and g_s12.fence would only
 // have to be created D3D12_FENCE_FLAG_SHARED -- which needs
-// VK_KHR_external_semaphore_win32, which ReShade does not enable, which is what
-// would need the hook.
+// VK_KHR_external_semaphore_win32. ReShade does not enable it, so the extension
+// has to be added at device creation for a device to carry it at all; with
+// Pipeline 2 or 3 and Import=1 the relay's create-device hook is what adds it,
+// and the import below is still this transport's own decision to take or not.
 //
 // Every Vulkan entry point is resolved through vkGetDeviceProcAddr out of a
 // LoadLibrary of vulkan-1.dll. There is deliberately no import of it: a D3D11

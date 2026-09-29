@@ -342,6 +342,18 @@ static reshade::api::effect_runtime *g_vkm_rt;
 static std::mutex g_vkm_cmd_mutex;
 static std::unordered_map<uint64_t, uint64_t> g_vkm_cmd_devices;
 
+// fg-trace.inc, included after the FG-input feed; the runtime hooks above it call in.
+static void FgtRegisterEvents(PFN_ReShadeRegisterEvent reg);
+static void FgtOnRuntime(reshade::api::effect_runtime *rt);
+// fg-relay.inc, included after this file's worker but called from it (and from
+// fg-input.inc's release paths, which is included just below).
+static bool FgRelayPending();
+static bool FgRelayWorker();
+static bool FgRelayIdleForRelease();
+static void FgRelayOnSessionRelease();
+static void FgRelayForceReleaseParks();
+static int  FgRelayEvaluate(void *cmd_raw, const NVSDK_NGX_Parameter *p);
+
 static void OnVkmInitCommandList(reshade::api::command_list *cmd)
 {
     auto *dev = cmd->get_device();
@@ -418,6 +430,7 @@ static void OnVkmInitRuntime(reshade::api::effect_runtime *rt)
     if (!is_vk) return;
 
     g_vkm_rt = rt;
+    FgtOnRuntime(rt);
     if (g_vkm.stopping)
     {
         g_vkm.stopping = false;
@@ -542,6 +555,7 @@ static void VkmRegisterEvents()
     reg(reshade::addon_event::init_command_list,      reinterpret_cast<void *>(&OnVkmInitCommandList));
     reg(reshade::addon_event::destroy_command_list,   reinterpret_cast<void *>(&OnVkmDestroyCommandList));
     reg(reshade::addon_event::destroy_device,         reinterpret_cast<void *>(&OnVkmDestroyDevice));
+    FgtRegisterEvents(reg);
     Log("[vkmirror] vk_mirror=1: the Vulkan NGX entry points will be hooked and a Vulkan "
         "game's own DLSS contract mirrored onto the private D3D12 session.");
 }
@@ -599,6 +613,23 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
                     if (g_vkm.ev_out[i] != 0) g_svk.EvSet(g_svk.dev, g_vkm.ev_out[i]);
             SetEvent(g_vkm.idle);
             break;
+        }
+
+        // A relay frame (Pipeline=2/3) is taken before the serial feed's poll:
+        // its copies have no ev_in to observe -- their completion reaches this
+        // thread through the copy fence or the shared semaphore, inside
+        // FgRelayWorker -- and its park is released by the D3D12 side.
+        if (FgRelayPending())
+        {
+            const bool rel_ok = FgRelayWorker();
+            if (rel_ok)
+            {
+                if (g_vkm.stalls != 0) g_vkm.stalls = 0;
+                g_vkm.fails = 0;
+                if (g_cfg.stage >= 3) CountDelivered();
+            }
+            SetEvent(g_vkm.idle);
+            continue;
         }
 
         // Poll rather than wait: a VkEvent signalled by the GPU has no waitable
@@ -762,6 +793,11 @@ static bool VkmShutdown()
     if (g_svk.EvSet != nullptr && g_svk.dev != nullptr)
         for (int i = 0; i < 2; ++i)
             if (g_vkm.ev_out[i] != 0) g_svk.EvSet(g_svk.dev, g_vkm.ev_out[i]);
+
+    // The relay's parks too: its release is a D3D12 signal this thread is about
+    // to stop servicing, and the command buffer parked on one of its events is
+    // the game's own.
+    FgRelayForceReleaseParks();
 
     if (!joined)
     {
@@ -1783,6 +1819,8 @@ typedef NVSDK_NGX_Result (*PFN_VkCreate1)(void *, void *, int, NVSDK_NGX_Paramet
     return r_;
 
 #include "fg-input.inc"
+#include "fg-relay.inc"
+#include "fg-trace.inc"
 
 static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
                                           const NVSDK_NGX_Handle *handle,
@@ -1815,10 +1853,14 @@ static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
     {
         // Never block the present thread on the render thread's lock: a skipped
         // frame keeps the game's own image, a blocked one can deadlock the device.
-        if (PresentAdapterFgInput() && FgInputIsFgHandle(handle) && TryEnterCriticalSection(&g_bridge_cs))
+        if (PresentAdapterFgInput() && FgInputIsFgHandle(handle))
         {
-            FgInputFrame(cmd, p);
-            LeaveCriticalSection(&g_bridge_cs);
+            FgTraceEvaluate(cmd, p);
+            if (TryEnterCriticalSection(&g_bridge_cs))
+            {
+                FgInputFrame(cmd, p);
+                LeaveCriticalSection(&g_bridge_cs);
+            }
         }
         VKM_FORWARD(fwd(cmd, handle, p, cb))
     }
